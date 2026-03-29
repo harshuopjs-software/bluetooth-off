@@ -1,0 +1,19 @@
+--- install.sh
++++ install.sh
+@@ -29,6 +29,20 @@
+ 
+ check_dependencies
+ 
++if ! command -v hcitool >/dev/null 2>&1; then
++    echo "hcitool not found. Installing from AUR..."
++    if command -v yay >/dev/null 2>&1; then
++        sudo -u $SUDO_USER yay -S --noconfirm bluez-deprecated-tools
++    elif command -v paru >/dev/null 2>&1; then
++        sudo -u $SUDO_USER paru -S --noconfirm bluez-deprecated-tools
++    else
++        echo "Please install bluez-deprecated-tools from AUR manually."
++        exit 1
++    fi
++fi
++
+ echo "Installation complete!"

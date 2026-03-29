@@ -1,6 +1,29 @@
 #!/bin/bash
-set -e
+# =====================================================================
+#  Bluetooth Proximity System — Automated Installer
+# =====================================================================
+#
+# PURPOSE:
+#   This script installs everything you need for the Bluetooth proximity
+#   system in one go. Run it once and you're done.
+#
+# WHAT IT DOES:
+#   1. Installs required packages (bluez, kdeconnect, etc.)
+#   2. Copies the proximity monitor script to /opt/bt-proximity/
+#   3. Installs the systemd service files
+#   4. Installs udev rules for Bluetooth power management
+#   5. Installs the systemd sleep hook
+#   6. Enables and starts all services
+#
+# USAGE:
+#   chmod +x install.sh
+#   sudo ./install.sh
+#
+# =====================================================================
 
+set -e  # Exit immediately if any command fails
+
+# Colors for pretty output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -46,6 +69,28 @@ success "KDE Connect installed"
 info "Installing optional utilities..."
 pacman -S --noconfirm --needed sshfs xdg-desktop-portal 2>/dev/null || true
 success "Optional packages installed"
+
+header "Step 1.5: Compiling hcitool (Deprecated but Required for RSSI)"
+if ! command -v hcitool >/dev/null 2>&1 && [ ! -f /opt/bt-proximity/hcitool ]; then
+    info "hcitool not found. Compiling from BlueZ 5.65 source..."
+    pacman -S --noconfirm --needed base-devel 2>/dev/null || true
+    WORKDIR=$(mktemp -d)
+    cd "$WORKDIR"
+    curl -sO https://mirrors.edge.kernel.org/pub/linux/bluetooth/bluez-5.65.tar.xz
+    tar xf bluez-5.65.tar.xz
+    cd bluez-5.65
+    info "Configuring and making hcitool (this takes ~1 min)..."
+    ./configure --disable-systemd --disable-udev --disable-obex --enable-deprecated >/dev/null 2>&1
+    make tools/hcitool >/dev/null 2>&1
+    mkdir -p /opt/bt-proximity
+    cp tools/hcitool /opt/bt-proximity/hcitool
+    chmod +x /opt/bt-proximity/hcitool
+    cd "$SCRIPT_DIR"
+    rm -rf "$WORKDIR"
+    success "hcitool successfully compiled and installed to /opt/bt-proximity/hcitool"
+else
+    success "hcitool is already available."
+fi
 
 header "Step 2: Enabling Bluetooth"
 
