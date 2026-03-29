@@ -134,7 +134,7 @@ def schedule_rtc_wake(seconds, logger):
 def suspend_system(logger):
     logger.info("Suspending system...")
     try:
-        subprocess.run(["systemctl", "suspend"], check=True, timeout=10)
+        subprocess.run(["systemctl", "suspend", "-i"], check=True, timeout=10)
     except subprocess.SubprocessError as e:
         logger.error(f"Failed to suspend: {e}")
 
