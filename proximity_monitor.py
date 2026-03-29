@@ -3,7 +3,7 @@
 import subprocess
 import time
 import sys
-import os
+import re
 import logging
 import signal
 import configparser
@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "check_interval": "5",
     "away_count_trigger": "3",
     "wake_check_interval": "30",
+    "scan_interval": "3",
     "log_level": "INFO",
 }
 
@@ -69,104 +70,82 @@ def ensure_bluetooth_on(logger):
         if "succeeded" in result.stdout.lower() or result.returncode == 0:
             logger.debug("Bluetooth adapter is ON")
             return True
-        else:
-            logger.warning(f"Bluetooth power on may have failed: {result.stdout}")
-            return False
     except subprocess.SubprocessError as e:
         logger.error(f"Failed to power on Bluetooth: {e}")
-        return False
+    return False
 
 
-def get_rssi_dbus(mac_address, logger):
+def get_rssi_from_scan(mac_address, scan_duration, logger):
     """
-    Read RSSI from BlueZ DBus API.
-    The RSSI property on org.bluez.Device1 is populated during discovery.
-    We trigger a short scan, then read the property.
+    Run a timed bluetoothctl scan and parse RSSI for the target device.
+    This is the only reliable way to get RSSI in modern BlueZ.
     """
     try:
-        bus = dbus.SystemBus()
-        manager = dbus.Interface(
-            bus.get_object("org.bluez", "/"),
-            "org.freedesktop.DBus.ObjectManager",
+        proc = subprocess.Popen(
+            ["bluetoothctl", "scan", "on"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-
-        device_path = "/org/bluez/hci0/dev_" + mac_address.replace(":", "_")
-
+        time.sleep(scan_duration)
+        proc.terminate()
         try:
-            device_obj = bus.get_object("org.bluez", device_path)
-            props = dbus.Interface(device_obj, "org.freedesktop.DBus.Properties")
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
-            try:
-                rssi = props.Get("org.bluez.Device1", "RSSI")
-                return int(rssi)
-            except dbus.exceptions.DBusException:
-                logger.debug("RSSI property not available (device not in discovery)")
-                return None
+        # After the scan, the RSSI property should be updated in DBus
+        try:
+            bus = dbus.SystemBus()
+            device_path = "/org/bluez/hci0/dev_" + mac_address.replace(":", "_")
+            manager = dbus.Interface(
+                bus.get_object("org.bluez", "/"),
+                "org.freedesktop.DBus.ObjectManager",
+            )
+            objects = manager.GetManagedObjects()
+            if device_path in objects:
+                dev_props = objects[device_path].get("org.bluez.Device1", {})
+                rssi = dev_props.get("RSSI", None)
+                if rssi is not None:
+                    return int(rssi)
+        except Exception as e:
+            logger.debug(f"DBus RSSI read failed: {e}")
 
-        except dbus.exceptions.DBusException:
-            logger.debug(f"Device {mac_address} not found in BlueZ object tree")
-            return None
+        # Fallback: stop the scan cleanly
+        subprocess.run(
+            ["bluetoothctl", "scan", "off"],
+            timeout=3,
+            capture_output=True,
+        )
+        return None
 
     except Exception as e:
-        logger.debug(f"DBus RSSI read failed: {e}")
+        logger.debug(f"Scan-based RSSI failed: {e}")
         return None
 
 
-def trigger_discovery(logger):
+def l2ping_check(mac_address, logger):
     """
-    Start a short Bluetooth discovery scan to refresh RSSI values.
-    bluetoothctl scan on for a few seconds, then off.
-    """
-    try:
-        scan_proc = subprocess.Popen(
-            ["bluetoothctl", "scan", "on"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        time.sleep(3)
-        subprocess.run(
-            ["bluetoothctl", "scan", "off"],
-            timeout=5,
-            capture_output=True,
-        )
-        scan_proc.terminate()
-        scan_proc.wait(timeout=3)
-    except Exception as e:
-        logger.debug(f"Discovery scan error: {e}")
-
-
-def is_phone_connected(mac_address, logger):
-    """
-    Check if the phone is currently connected via bluetoothctl.
+    Bluetooth ping — returns (reachable, avg_latency_ms).
+    This is the most reliable proximity check.
+    When phone moves out of BT range, this fails entirely.
     """
     try:
         result = subprocess.run(
-            ["bluetoothctl", "info", mac_address],
-            timeout=5,
+            ["l2ping", "-c", "2", "-t", "3", mac_address],
+            timeout=12,
             capture_output=True,
             text=True,
         )
-        if result.returncode == 0 and "Connected: yes" in result.stdout:
-            return True
-        return False
-    except subprocess.SubprocessError:
-        return False
-
-
-def is_phone_reachable(mac_address, logger):
-    """
-    Fallback: Bluetooth L2CAP ping to check if phone is in range.
-    """
-    try:
-        result = subprocess.run(
-            ["l2ping", "-c", "1", "-t", "5", mac_address],
-            timeout=10,
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
+        if result.returncode == 0:
+            latencies = re.findall(r"time\s+([\d.]+)ms", result.stdout)
+            if latencies:
+                avg = sum(float(x) for x in latencies) / len(latencies)
+                return True, avg
+            return True, 0.0
+        return False, 0.0
     except (subprocess.TimeoutExpired, subprocess.SubprocessError):
-        return False
+        return False, 0.0
 
 
 def schedule_rtc_wake(seconds, logger):
@@ -192,10 +171,28 @@ def suspend_system(logger):
         logger.error(f"Failed to suspend: {e}")
 
 
-def enter_suspend_cycle(mac_address, threshold, wake_interval, running_ref, logger):
+def phone_is_nearby(mac_address, threshold, scan_duration, logger):
     """
-    Suspend-wake loop: sleep, wake briefly to check phone, repeat.
+    Combined check: try RSSI first, then fall back to l2ping reachability.
+    Returns (nearby: bool, detail: str)
     """
+    # Method 1: Try to get RSSI via scan
+    rssi = get_rssi_from_scan(mac_address, scan_duration, logger)
+    if rssi is not None:
+        if rssi >= threshold:
+            return True, f"RSSI={rssi} dBm (>= {threshold})"
+        else:
+            return False, f"RSSI={rssi} dBm (< {threshold})"
+
+    # Method 2: l2ping reachability
+    reachable, latency = l2ping_check(mac_address, logger)
+    if reachable:
+        return True, f"l2ping OK (latency={latency:.1f}ms, no RSSI)"
+    else:
+        return False, "l2ping FAILED — phone unreachable"
+
+
+def enter_suspend_cycle(mac, threshold, wake_interval, scan_dur, running_ref, logger):
     while running_ref[0]:
         if not schedule_rtc_wake(wake_interval, logger):
             logger.error("Cannot set RTC alarm; aborting suspend")
@@ -207,22 +204,12 @@ def enter_suspend_cycle(mac_address, threshold, wake_interval, running_ref, logg
         ensure_bluetooth_on(logger)
         time.sleep(2)
 
-        trigger_discovery(logger)
-        wake_rssi = get_rssi_dbus(mac_address, logger)
-
-        if wake_rssi is not None and wake_rssi >= threshold:
-            logger.info(f"Phone is back! RSSI: {wake_rssi} dBm — staying awake")
+        nearby, detail = phone_is_nearby(mac, threshold, scan_dur, logger)
+        if nearby:
+            logger.info(f"Phone is back! {detail} — staying awake")
             return True
-
-        if is_phone_connected(mac_address, logger):
-            logger.info("Phone is connected — staying awake")
-            return True
-
-        if is_phone_reachable(mac_address, logger):
-            logger.info("Phone detected via Bluetooth ping — staying awake")
-            return True
-
-        logger.info("Phone still away — going back to sleep...")
+        else:
+            logger.info(f"Phone still away: {detail} — going back to sleep...")
 
     return False
 
@@ -237,6 +224,7 @@ def main():
     interval = int(config.get("check_interval", DEFAULT_CONFIG["check_interval"]))
     away_trigger = int(config.get("away_count_trigger", DEFAULT_CONFIG["away_count_trigger"]))
     wake_interval = int(config.get("wake_check_interval", DEFAULT_CONFIG["wake_check_interval"]))
+    scan_dur = int(config.get("scan_interval", DEFAULT_CONFIG["scan_interval"]))
     log_level = config.get("log_level", DEFAULT_CONFIG["log_level"])
 
     logger = setup_logging(log_level)
@@ -251,12 +239,12 @@ def main():
     logger.info(f"Check Interval:   {interval}s")
     logger.info(f"Away Trigger:     {away_trigger} consecutive readings")
     logger.info(f"Wake Interval:    {wake_interval}s")
+    logger.info(f"Scan Duration:    {scan_dur}s")
 
     ensure_bluetooth_on(logger)
 
     away_count = 0
     running = [True]
-    scan_counter = 0
 
     def handle_signal(signum, frame):
         sig_name = signal.Signals(signum).name
@@ -267,42 +255,19 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)
 
     while running[0]:
-        # Trigger a discovery scan every 3 cycles to refresh RSSI
-        scan_counter += 1
-        if scan_counter % 3 == 1:
-            trigger_discovery(logger)
+        nearby, detail = phone_is_nearby(mac, threshold, scan_dur, logger)
 
-        rssi = get_rssi_dbus(mac, logger)
-
-        if rssi is not None:
-            logger.info(f"Phone RSSI: {rssi} dBm (threshold: {threshold} dBm)")
-
-            if rssi < threshold:
-                away_count += 1
-                logger.warning(f"Phone is far! Away count: {away_count}/{away_trigger}")
-
-                if away_count >= away_trigger:
-                    logger.warning("Phone out of range — entering suspend cycle")
-                    if enter_suspend_cycle(mac, threshold, wake_interval, running, logger):
-                        away_count = 0
-            else:
-                away_count = 0
+        if nearby:
+            logger.info(f"Phone nearby: {detail}")
+            away_count = 0
         else:
-            # RSSI not available — try connection check and l2ping
-            if is_phone_connected(mac, logger):
-                logger.info("Phone is connected (RSSI unavailable)")
-                away_count = 0
-            elif is_phone_reachable(mac, logger):
-                logger.info("Phone reachable via Bluetooth ping (RSSI unavailable)")
-                away_count = 0
-            else:
-                away_count += 1
-                logger.warning(f"Phone unreachable! Away count: {away_count}/{away_trigger}")
+            away_count += 1
+            logger.warning(f"Phone away: {detail} [{away_count}/{away_trigger}]")
 
-                if away_count >= away_trigger:
-                    logger.warning("Phone disappeared — entering suspend cycle")
-                    if enter_suspend_cycle(mac, threshold, wake_interval, running, logger):
-                        away_count = 0
+            if away_count >= away_trigger:
+                logger.warning("Phone out of range — entering suspend cycle")
+                if enter_suspend_cycle(mac, threshold, wake_interval, scan_dur, running, logger):
+                    away_count = 0
 
         time.sleep(interval)
 
