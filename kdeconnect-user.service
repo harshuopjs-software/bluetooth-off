@@ -1,0 +1,13 @@
+[Unit]
+Description=KDE Connect Daemon — Phone Sync Service
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/kdeconnectd
+Restart=on-failure
+RestartSec=3
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target

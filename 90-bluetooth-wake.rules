@@ -1,0 +1,3 @@
+ACTION=="add|bind", SUBSYSTEM=="usb", ATTR{idVendor}=="8087", ATTR{idProduct}=="0029", ATTR{power/control}="on"
+ACTION=="add|bind", SUBSYSTEM=="usb", ATTR{idVendor}=="8087", ATTR{idProduct}=="0029", ATTR{power/wakeup}="enabled"
+ACTION=="add", SUBSYSTEM=="bluetooth", KERNEL=="hci*", TEST=="power/wakeup", ATTR{power/wakeup}="enabled"
