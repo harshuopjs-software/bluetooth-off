@@ -2,7 +2,7 @@
 
 case "$1" in
     pre)
-        hciconfig hci0 up 2>/dev/null
+        bluetoothctl power on 2>/dev/null
 
         for dev in /sys/class/bluetooth/hci*/device/power/wakeup; do
             [ -f "$dev" ] && echo enabled > "$dev" 2>/dev/null
@@ -17,8 +17,6 @@ case "$1" in
         ;;
 
     post)
-        sleep 1
-        hciconfig hci0 up 2>/dev/null
         sleep 1
         bluetoothctl power on 2>/dev/null
         ;;

@@ -1,10 +1,42 @@
+# =====================================================================
+# systemd User Service: KDE Connect Daemon
+# =====================================================================
+#
+# PURPOSE:
+#   Runs the KDE Connect daemon as a user service.
+#   KDE Connect syncs your phone with your laptop:
+#     - Phone notifications appear on your laptop
+#     - Send/receive SMS from your laptop
+#     - See incoming phone calls on your laptop
+#     - Share files, clipboard, battery status, and more
+#
+# NOTE:
+#   KDE Plasma desktop already auto-starts KDE Connect.
+#   This service is for NON-KDE desktops (GNOME, i3, Hyprland,
+#   Sway, XFCE, etc.) where KDE Connect doesn't auto-start.
+#
+# INSTALLATION:
+#   mkdir -p ~/.config/systemd/user/
+#   cp kdeconnect-user.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable kdeconnect-user.service
+#   systemctl --user start kdeconnect-user.service
+#
+# WHY A USER SERVICE (not system service)?
+#   KDE Connect needs to interact with your desktop session
+#   (show notifications, access clipboard, etc.). System services
+#   run as root and don't have access to your graphical session.
+#   User services run in YOUR session with YOUR permissions.
+#
+# =====================================================================
+
 [Unit]
 Description=KDE Connect Daemon — Phone Sync Service
 After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/lib/kdeconnectd
+ExecStart=/usr/bin/kdeconnectd
 Restart=on-failure
 RestartSec=3
 Environment=DISPLAY=:0
